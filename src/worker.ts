@@ -1,213 +1,310 @@
-interface ScheduledJob {
+interface CronJob {
   id: string;
   name: string;
-  cronExpression: string;
-  endpoint: string;
+  schedule: string;
+  url: string;
   method: string;
   headers: Record<string, string>;
   body?: string;
-  lastRun?: string;
-  nextRun: string;
   enabled: boolean;
+  lastRun?: number;
+  nextRun: number;
+  createdAt: number;
   failureCount: number;
-  createdAt: string;
+  alertEmail?: string;
 }
 
 interface ExecutionHistory {
   id: string;
   jobId: string;
-  jobName: string;
-  timestamp: string;
-  status: 'success' | 'failure';
-  response?: string;
-  duration: number;
+  timestamp: number;
+  status: number;
+  responseTime: number;
+  success: boolean;
+  error?: string;
 }
 
 interface ScheduleRequest {
   name: string;
-  cronExpression: string;
-  endpoint: string;
+  schedule: string;
+  url: string;
   method?: string;
   headers?: Record<string, string>;
   body?: string;
+  alertEmail?: string;
 }
 
-const STORAGE_KEYS = {
-  JOBS: 'fleet_cron_jobs',
-  HISTORY: 'fleet_cron_history',
-  CONFIG: 'fleet_cron_config'
+const KV_JOBS = "fleet_cron_jobs";
+const KV_HISTORY = "fleet_cron_history";
+const KV_LAST_RUN = "fleet_cron_last_run";
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
 };
 
-const DEFAULT_CONFIG = {
-  maxHistory: 1000,
-  alertThreshold: 3,
-  healthCheckEndpoint: '/health'
+const SECURITY_HEADERS = {
+  "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:;",
+  "X-Frame-Options": "DENY",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
 };
 
-class CronParser {
-  static validate(expression: string): boolean {
-    const parts = expression.trim().split(/\s+/);
-    if (parts.length !== 5) return false;
-    
-    const [minute, hour, dayOfMonth, month, dayOfWeek] = parts;
-    
-    const validatePart = (part: string, min: number, max: number): boolean => {
-      if (part === '*') return true;
-      
-      const ranges = part.split(',');
-      for (const range of ranges) {
-        if (range.includes('-')) {
-          const [start, end] = range.split('-').map(Number);
-          if (isNaN(start) || isNaN(end) || start < min || end > max || start > end) {
-            return false;
-          }
-        } else if (range.includes('/')) {
-          const [value, step] = range.split('/').map(v => v === '*' ? v : Number(v));
-          if (step === undefined || isNaN(step as number) || (step as number) < 1) {
-            return false;
-          }
-        } else {
-          const num = Number(range);
-          if (isNaN(num) || num < min || num > max) {
-            return false;
-          }
-        }
-      }
-      return true;
-    };
-    
-    return validatePart(minute, 0, 59) &&
-           validatePart(hour, 0, 23) &&
-           validatePart(dayOfMonth, 1, 31) &&
-           validatePart(month, 1, 12) &&
-           validatePart(dayOfWeek, 0, 6);
+function parseCron(schedule: string): number {
+  const parts = schedule.trim().split(/\s+/);
+  if (parts.length !== 5) {
+    throw new Error("Invalid cron format. Expected 5 fields: minute hour day month weekday");
   }
 
-  static getNextRun(expression: string, fromDate: Date = new Date()): Date {
-    const [minute, hour, dayOfMonth, month, dayOfWeek] = expression.split(/\s+/);
-    
-    const next = new Date(fromDate.getTime() + 60000);
-    next.setSeconds(0, 0);
-    
-    while (true) {
-      if (!this.matchesField(month, next.getMonth() + 1)) {
-        next.setMonth(next.getMonth() + 1);
-        next.setDate(1);
-        next.setHours(0, 0, 0, 0);
-        continue;
-      }
-      
-      if (!this.matchesField(dayOfMonth, next.getDate()) || 
-          !this.matchesField(dayOfWeek, next.getDay())) {
-        next.setDate(next.getDate() + 1);
-        next.setHours(0, 0, 0, 0);
-        continue;
-      }
-      
-      if (!this.matchesField(hour, next.getHours())) {
-        next.setHours(next.getHours() + 1);
-        next.setMinutes(0, 0, 0);
-        continue;
-      }
-      
-      if (!this.matchesField(minute, next.getMinutes())) {
-        next.setMinutes(next.getMinutes() + 1);
-        continue;
-      }
-      
-      break;
+  const [minute, hour, day, month, weekday] = parts;
+  const now = new Date();
+  const next = new Date(now.getTime() + 60000);
+
+  while (true) {
+    if (month !== "*" && parseInt(month) !== next.getMonth() + 1) {
+      next.setMonth(next.getMonth() + 1);
+      next.setDate(1);
+      next.setHours(0, 0, 0, 0);
+      continue;
     }
-    
-    return next;
+
+    if (day !== "*" && parseInt(day) !== next.getDate()) {
+      next.setDate(next.getDate() + 1);
+      next.setHours(0, 0, 0, 0);
+      continue;
+    }
+
+    if (weekday !== "*" && parseInt(weekday) !== next.getDay()) {
+      next.setDate(next.getDate() + 1);
+      next.setHours(0, 0, 0, 0);
+      continue;
+    }
+
+    if (hour !== "*" && parseInt(hour) !== next.getHours()) {
+      next.setHours(next.getHours() + 1);
+      next.setMinutes(0, 0, 0);
+      continue;
+    }
+
+    if (minute !== "*" && parseInt(minute) !== next.getMinutes()) {
+      next.setMinutes(next.getMinutes() + 1);
+      next.setSeconds(0, 0);
+      continue;
+    }
+
+    break;
   }
 
-  private static matchesField(field: string, value: number): boolean {
-    if (field === '*') return true;
-    
-    const parts = field.split(',');
-    for (const part of parts) {
-      if (part.includes('-')) {
-        const [start, end] = part.split('-').map(Number);
-        if (value >= start && value <= end) return true;
-      } else if (part.includes('/')) {
-        const [range, stepStr] = part.split('/');
-        const step = parseInt(stepStr);
-        if (range === '*') {
-          if (value % step === 0) return true;
-        }
-      } else if (parseInt(part) === value) {
-        return true;
+  return next.getTime();
+}
+
+async function executeJob(job: CronJob, env: Env): Promise<void> {
+  const startTime = Date.now();
+  const historyEntry: ExecutionHistory = {
+    id: crypto.randomUUID(),
+    jobId: job.id,
+    timestamp: startTime,
+    status: 0,
+    responseTime: 0,
+    success: false,
+  };
+
+  try {
+    const response = await fetch(job.url, {
+      method: job.method,
+      headers: job.headers,
+      body: job.body,
+    });
+
+    const responseTime = Date.now() - startTime;
+    historyEntry.responseTime = responseTime;
+    historyEntry.status = response.status;
+    historyEntry.success = response.ok;
+
+    if (!response.ok) {
+      historyEntry.error = `HTTP ${response.status}`;
+      job.failureCount++;
+
+      if (job.alertEmail && job.failureCount >= 3) {
+        await sendAlert(job, `Job "${job.name}" failed ${job.failureCount} times`, env);
       }
+    } else {
+      job.failureCount = 0;
     }
-    return false;
+  } catch (error) {
+    historyEntry.responseTime = Date.now() - startTime;
+    historyEntry.error = error instanceof Error ? error.message : "Unknown error";
+    job.failureCount++;
+
+    if (job.alertEmail && job.failureCount >= 3) {
+      await sendAlert(job, `Job "${job.name}" failed with error: ${historyEntry.error}`, env);
+    }
+  }
+
+  job.lastRun = startTime;
+  job.nextRun = parseCron(job.schedule);
+
+  await env.FLEET_CRON.put(`${KV_JOBS}:${job.id}`, JSON.stringify(job));
+  
+  const historyKey = `${KV_HISTORY}:${job.id}:${historyEntry.id}`;
+  await env.FLEET_CRON.put(historyKey, JSON.stringify(historyEntry));
+
+  const historyList = await env.FLEET_CRON.get(`${KV_HISTORY}:${job.id}`, "json") as string[] || [];
+  historyList.unshift(historyEntry.id);
+  if (historyList.length > 100) historyList.pop();
+  await env.FLEET_CRON.put(`${KV_HISTORY}:${job.id}`, JSON.stringify(historyList));
+}
+
+async function sendAlert(job: CronJob, message: string, env: Env): Promise<void> {
+  if (!job.alertEmail) return;
+
+  try {
+    await fetch("https://api.mailchannels.net/tx/v1/send", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email: job.alertEmail }] }],
+        from: { email: "alerts@fleet-cron.com", name: "Fleet Cron" },
+        subject: `Alert: ${job.name}`,
+        content: [{ type: "text/plain", value: message }],
+      }),
+    });
+  } catch (error) {
+    console.error("Failed to send alert:", error);
   }
 }
 
-class FleetCron {
-  private env: any;
-
-  constructor(env: any) {
-    this.env = env;
+async function handleSchedule(request: Request, env: Env): Promise<Response> {
+  if (request.method === "OPTIONS") {
+    return new Response(null, { headers: CORS_HEADERS });
   }
 
-  async handleRequest(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
+  if (request.method !== "POST") {
+    return new Response(JSON.stringify({ error: "Method not allowed" }), {
+      status: 405,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
 
-    if (path === '/health') {
-      return new Response(JSON.stringify({ status: 'healthy', timestamp: new Date().toISOString() }), {
-        headers: { 'Content-Type': 'application/json' }
+  try {
+    const data: ScheduleRequest = await request.json();
+    
+    if (!data.name || !data.schedule || !data.url) {
+      return new Response(JSON.stringify({ error: "Missing required fields" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
       });
     }
 
-    if (path === '/') {
-      return this.handleUI();
-    }
+    const nextRun = parseCron(data.schedule);
+    const job: CronJob = {
+      id: crypto.randomUUID(),
+      name: data.name,
+      schedule: data.schedule,
+      url: data.url,
+      method: data.method || "GET",
+      headers: data.headers || {},
+      body: data.body,
+      enabled: true,
+      nextRun,
+      createdAt: Date.now(),
+      failureCount: 0,
+      alertEmail: data.alertEmail,
+    };
 
-    if (path === '/api/schedule' && request.method === 'POST') {
-      return this.handleSchedule(request);
-    }
+    await env.FLEET_CRON.put(`${KV_JOBS}:${job.id}`, JSON.stringify(job));
 
-    if (path === '/api/jobs' && request.method === 'GET') {
-      return this.handleGetJobs();
-    }
+    return new Response(JSON.stringify({ id: job.id, nextRun: new Date(nextRun).toISOString() }), {
+      status: 201,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ 
+      error: error instanceof Error ? error.message : "Invalid request" 
+    }), {
+      status: 400,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
+}
 
-    if (path === '/api/history' && request.method === 'GET') {
-      return this.handleGetHistory();
-    }
+async function handleJobs(request: Request, env: Env): Promise<Response> {
+  const jobs: CronJob[] = [];
+  const list = await env.FLEET_CRON.list({ prefix: `${KV_JOBS}:` });
 
-    if (path.startsWith('/api/jobs/') && request.method === 'DELETE') {
-      const id = path.split('/').pop();
-      return id ? this.handleDeleteJob(id) : new Response('Not found', { status: 404 });
-    }
-
-    return new Response('Not found', { status: 404 });
+  for (const key of list.keys) {
+    const job = await env.FLEET_CRON.get(key.name, "json") as CronJob;
+    if (job) jobs.push(job);
   }
 
-  private async handleUI(): Promise<Response> {
-    const html = `
+  return new Response(JSON.stringify(jobs), {
+    headers: { 
+      "Content-Type": "application/json", 
+      ...CORS_HEADERS,
+      ...SECURITY_HEADERS,
+    },
+  });
+}
+
+async function handleHistory(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const jobId = url.searchParams.get("jobId");
+  const limit = parseInt(url.searchParams.get("limit") || "50");
+
+  if (!jobId) {
+    return new Response(JSON.stringify({ error: "Missing jobId parameter" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
+
+  const historyList = await env.FLEET_CRON.get(`${KV_HISTORY}:${jobId}`, "json") as string[] || [];
+  const limitedList = historyList.slice(0, limit);
+  const history: ExecutionHistory[] = [];
+
+  for (const id of limitedList) {
+    const entry = await env.FLEET_CRON.get(`${KV_HISTORY}:${jobId}:${id}`, "json") as ExecutionHistory;
+    if (entry) history.push(entry);
+  }
+
+  return new Response(JSON.stringify(history), {
+    headers: { 
+      "Content-Type": "application/json", 
+      ...CORS_HEADERS,
+      ...SECURITY_HEADERS,
+    },
+  });
+}
+
+function handleHealth(): Response {
+  return new Response(JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }), {
+    headers: { 
+      "Content-Type": "application/json",
+      ...SECURITY_HEADERS,
+    },
+  });
+}
+
+function handleHome(): Response {
+  const html = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Fleet Cron - Scheduled Task Manager</title>
+    <title>Fleet Cron - Cron Job Scheduler</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
             --dark: #0a0a0f;
-            --darker: #050508;
             --accent: #059669;
-            --accent-light: #10b981;
-            --text: #e2e8f0;
-            --text-secondary: #94a3b8;
-            --border: #1e293b;
-            --success: #10b981;
-            --warning: #f59e0b;
-            --danger: #ef4444;
-            --card-bg: #111827;
+            --light: #f8fafc;
+            --gray: #64748b;
         }
         
         * {
@@ -217,475 +314,291 @@ class FleetCron {
         }
         
         body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-            background: var(--dark);
-            color: var(--text);
+            font-family: 'Inter', sans-serif;
+            background-color: var(--dark);
+            color: var(--light);
             line-height: 1.6;
             min-height: 100vh;
+            padding: 20px;
         }
         
         .container {
             max-width: 1200px;
             margin: 0 auto;
-            padding: 0 20px;
         }
         
         header {
-            background: var(--darker);
-            border-bottom: 1px solid var(--border);
-            padding: 1.5rem 0;
-            margin-bottom: 2rem;
-        }
-        
-        .header-content {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+            text-align: center;
+            padding: 3rem 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            margin-bottom: 3rem;
         }
         
         .logo {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-        
-        .logo-icon {
-            width: 32px;
-            height: 32px;
-            background: linear-gradient(135deg, var(--accent), var(--accent-light));
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-weight: bold;
-            font-size: 18px;
-        }
-        
-        .logo-text {
-            font-size: 1.5rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, var(--accent), var(--accent-light));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        
-        .hero {
-            text-align: center;
-            margin-bottom: 3rem;
-            padding: 2rem;
-            background: var(--card-bg);
-            border-radius: 12px;
-            border: 1px solid var(--border);
-        }
-        
-        .hero h1 {
             font-size: 2.5rem;
+            font-weight: 700;
+            color: var(--accent);
             margin-bottom: 1rem;
-            background: linear-gradient(135deg, var(--accent), var(--accent-light));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
         }
         
-        .hero p {
-            color: var(--text-secondary);
-            font-size: 1.1rem;
-            max-width: 600px;
-            margin: 0 auto;
+        .tagline {
+            font-size: 1.2rem;
+            color: var(--gray);
+            font-weight: 300;
         }
         
-        .dashboard {
+        .features {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
             gap: 2rem;
-            margin-bottom: 3rem;
+            margin-bottom: 4rem;
         }
         
-        @media (max-width: 768px) {
-            .dashboard {
-                grid-template-columns: 1fr;
-            }
-        }
-        
-        .card {
-            background: var(--card-bg);
-            border: 1px solid var(--border);
+        .feature-card {
+            background: rgba(255, 255, 255, 0.05);
             border-radius: 12px;
-            padding: 1.5rem;
+            padding: 2rem;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: transform 0.3s ease, border-color 0.3s ease;
         }
         
-        .card-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 1.5rem;
-            padding-bottom: 1rem;
-            border-bottom: 1px solid var(--border);
-        }
-        
-        .card-title {
-            font-size: 1.25rem;
-            font-weight: 600;
-            color: var(--text);
-        }
-        
-        .btn {
-            background: var(--accent);
-            color: white;
-            border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 6px;
-            font-family: 'Inter', sans-serif;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.2s;
-            text-decoration: none;
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-        }
-        
-        .btn:hover {
-            background: var(--accent-light);
-            transform: translateY(-1px);
-        }
-        
-        .btn-danger {
-            background: var(--danger);
-        }
-        
-        .btn-danger:hover {
-            background: #dc2626;
-        }
-        
-        .form-group {
-            margin-bottom: 1rem;
-        }
-        
-        label {
-            display: block;
-            margin-bottom: 0.5rem;
-            color: var(--text-secondary);
-            font-weight: 500;
-        }
-        
-        input, select, textarea {
-            width: 100%;
-            padding: 0.75rem;
-            background: var(--dark);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            color: var(--text);
-            font-family: 'Inter', sans-serif;
-            font-size: 0.95rem;
-        }
-        
-        input:focus, select:focus, textarea:focus {
-            outline: none;
+        .feature-card:hover {
+            transform: translateY(-5px);
             border-color: var(--accent);
         }
         
-        .job-list {
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
+        .feature-icon {
+            font-size: 2rem;
+            margin-bottom: 1rem;
+            color: var(--accent);
         }
         
-        .job-item {
-            background: var(--dark);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 1rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .job-info h4 {
-            color: var(--text);
-            margin-bottom: 0.25rem;
-        }
-        
-        .job-meta {
-            display: flex;
-            gap: 1rem;
-            color: var(--text-secondary);
-            font-size: 0.875rem;
-        }
-        
-        .status-badge {
-            padding: 0.25rem 0.75rem;
-            border-radius: 999px;
-            font-size: 0.75rem;
+        .feature-title {
+            font-size: 1.3rem;
             font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
+            margin-bottom: 0.8rem;
+            color: var(--light);
         }
         
-        .status-active {
-            background: rgba(16, 185, 129, 0.1);
-            color: var(--success);
-            border: 1px solid rgba(16, 185, 129, 0.3);
+        .feature-desc {
+            color: var(--gray);
+            font-size: 0.95rem;
         }
         
-        .status-paused {
-            background: rgba(245, 158, 11, 0.1);
-            color: var(--warning);
-            border: 1px solid rgba(245, 158, 11, 0.3);
+        .endpoints {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 4rem;
+            border: 1px solid rgba(255, 255, 255, 0.1);
         }
         
-        .history-item {
-            background: var(--dark);
-            border: 1px solid var(--border);
+        .endpoints h2 {
+            color: var(--accent);
+            margin-bottom: 1.5rem;
+            font-size: 1.8rem;
+        }
+        
+        .endpoint {
+            background: rgba(0, 0, 0, 0.3);
             border-radius: 8px;
-            padding: 1rem;
-            margin-bottom: 0.75rem;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+            border-left: 4px solid var(--accent);
         }
         
-        .history-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 0.5rem;
-        }
-        
-        .history-status {
+        .method {
+            display: inline-block;
+            padding: 0.3rem 0.8rem;
+            background: var(--accent);
+            color: white;
+            border-radius: 4px;
             font-weight: 600;
+            font-size: 0.9rem;
+            margin-right: 1rem;
         }
         
-        .status-success {
-            color: var(--success);
+        .path {
+            font-family: 'Monaco', 'Courier New', monospace;
+            color: var(--light);
+            font-weight: 500;
         }
         
-        .status-failure {
-            color: var(--danger);
-        }
-        
-        .history-time {
-            color: var(--text-secondary);
-            font-size: 0.875rem;
+        .desc {
+            color: var(--gray);
+            margin-top: 0.8rem;
+            font-size: 0.95rem;
         }
         
         footer {
             text-align: center;
             padding: 2rem 0;
-            margin-top: 3rem;
-            border-top: 1px solid var(--border);
-            color: var(--text-secondary);
-            font-size: 0.875rem;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            color: var(--gray);
+            font-size: 0.9rem;
         }
         
         .footer-logo {
             color: var(--accent);
-            font-weight: 700;
+            font-weight: 600;
             margin-bottom: 0.5rem;
         }
         
-        .cron-example {
-            font-family: monospace;
-            background: var(--dark);
-            padding: 0.25rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.875rem;
-            color: var(--accent-light);
-        }
-        
-        .alert {
-            padding: 1rem;
-            border-radius: 8px;
-            margin-bottom: 1rem;
-            display: none;
-        }
-        
-        .alert-success {
-            background: rgba(16, 185, 129, 0.1);
-            border: 1px solid rgba(16, 185, 129, 0.3);
-            color: var(--success);
-        }
-        
-        .alert-error {
-            background: rgba(239, 68, 68, 0.1);
-            border: 1px solid rgba(239, 68, 68, 0.3);
-            color: var(--danger);
+        @media (max-width: 768px) {
+            .features {
+                grid-template-columns: 1fr;
+            }
+            
+            header {
+                padding: 2rem 0;
+            }
+            
+            .logo {
+                font-size: 2rem;
+            }
         }
     </style>
 </head>
 <body>
-    <header>
-        <div class="container">
-            <div class="header-content">
-                <div class="logo">
-                    <div class="logo-icon">F</div>
-                    <div class="logo-text">Fleet Cron</div>
-                </div>
-                <div>
-                    <span class="status-badge status-active">System Active</span>
-                </div>
-            </div>
-        </div>
-    </header>
-    
-    <main class="container">
-        <section class="hero">
-            <h1>Set it and forget it</h1>
-            <p>Fleet Cron manages your scheduled tasks, recurring health checks, and batch processing with enterprise reliability.</p>
-        </section>
+    <div class="container">
+        <header>
+            <div class="logo">Fleet Cron</div>
+            <div class="tagline">Reliable Cron Job Scheduler for Cloudflare Workers</div>
+        </header>
         
-        <div class="dashboard">
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">Schedule New Job</h2>
-                </div>
-                <form id="scheduleForm">
-                    <div id="alert" class="alert"></div>
-                    
-                    <div class="form-group">
-                        <label for="name">Job Name</label>
-                        <input type="text" id="name" placeholder="Daily Health Check" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="cronExpression">Cron Expression</label>
-                        <input type="text" id="cronExpression" placeholder="0 9 * * *" required>
-                        <small style="color: var(--text-secondary); margin-top: 0.25rem; display: block;">
-                            Format: minute hour day-of-month month day-of-week<br>
-                            Example: <span class="cron-example">0 9 * * *</span> (Daily at 9:00 AM)
-                        </small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="endpoint">Endpoint URL</label>
-                        <input type="url" id="endpoint" placeholder="https://api.example.com/health" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="method">HTTP Method</label>
-                        <select id="method">
-                            <option value="GET">GET</option>
-                            <option value="POST">POST</option>
-                            <option value="PUT">PUT</option>
-                            <option value="DELETE">DELETE</option>
-                            <option value="PATCH">PATCH</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="headers">Headers (JSON)</label>
-                        <textarea id="headers" rows="3" placeholder='{"Content-Type": "application/json", "Authorization": "Bearer token"}'></textarea>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="body">Request Body (JSON)</label>
-                        <textarea id="body" rows="4" placeholder='{"action": "health_check"}'></textarea>
-                    </div>
-                    
-                    <button type="submit" class="btn">
-                        <span>Schedule Job</span>
-                    </button>
-                </form>
+        <div class="features">
+            <div class="feature-card">
+                <div class="feature-icon">⏰</div>
+                <div class="feature-title">Cron Parser</div>
+                <div class="feature-desc">Advanced cron expression parser supporting standard 5-field format with intelligent scheduling.</div>
             </div>
             
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">Active Jobs</h2>
-                    <button class="btn" onclick="loadJobs()">Refresh</button>
-                </div>
-                <div class="job-list" id="jobsList">
-                    <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
-                        Loading jobs...
-                    </div>
-                </div>
+            <div class="feature-card">
+                <div class="feature-icon">🏥</div>
+                <div class="feature-title">Health Checks</div>
+                <div class="feature-desc">Scheduled health checks with configurable intervals and failure detection.</div>
+            </div>
+            
+            <div class="feature-card">
+                <div class="feature-icon">🔄</div>
+                <div class="feature-title">Batch Jobs</div>
+                <div class="feature-desc">Recurring batch job execution with configurable payloads and headers.</div>
+            </div>
+            
+            <div class="feature-card">
+                <div class="feature-icon">🚨</div>
+                <div class="feature-title">Failure Alerts</div>
+                <div class="feature-desc">Email alerts for job failures with configurable thresholds and notification rules.</div>
+            </div>
+            
+            <div class="feature-card">
+                <div class="feature-icon">📊</div>
+                <div class="feature-title">Execution History</div>
+                <div class="feature-desc">Detailed execution history with response times, status codes, and error tracking.</div>
+            </div>
+            
+            <div class="feature-card">
+                <div class="feature-icon">🔒</div>
+                <div class="feature-title">Secure & Reliable</div>
+                <div class="feature-desc">Built with security headers, CSP, and zero dependencies for maximum reliability.</div>
             </div>
         </div>
         
-        <div class="card">
-            <div class="card-header">
-                <h2 class="card-title">Execution History</h2>
+        <div class="endpoints">
+            <h2>API Endpoints</h2>
+            
+            <div class="endpoint">
+                <span class="method">POST</span>
+                <span class="path">/api/schedule</span>
+                <div class="desc">Schedule a new cron job. Requires name, schedule (cron expression), and URL.</div>
             </div>
-            <div id="historyList">
-                <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
-                    Loading history...
-                </div>
+            
+            <div class="endpoint">
+                <span class="method">GET</span>
+                <span class="path">/api/jobs</span>
+                <div class="desc">Retrieve all scheduled jobs with their current status and next execution time.</div>
+            </div>
+            
+            <div class="endpoint">
+                <span class="method">GET</span>
+                <span class="path">/api/history?jobId=UUID&limit=50</span>
+                <div class="desc">Get execution history for a specific job. Optional limit parameter (default: 50).</div>
+            </div>
+            
+            <div class="endpoint">
+                <span class="method">GET</span>
+                <span class="path">/health</span>
+                <div class="desc">Health check endpoint. Returns status and timestamp.</div>
             </div>
         </div>
-    </main>
-    
-    <footer>
-        <div class="container">
+        
+        <footer>
             <div class="footer-logo">Fleet Cron</div>
-            <p>Scheduled tasks, recurring health checks, batch processing</p>
-            <p style="margin-top: 1rem; font-size: 0.75rem; opacity: 0.7;">
-                &copy; ${new Date().getFullYear()} Fleet Systems. All systems operational.
-            </p>
-        </div>
-    </footer>
+            <div>Reliable cron job scheduling for Cloudflare Workers</div>
+            <div style="margin-top: 0.5rem; font-size: 0.8rem;">Zero dependencies • TypeScript • Secure by design</div>
+        </footer>
+    </div>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html",
+      ...SECURITY_HEADERS,
+    },
+  });
+}
+
+async function scheduledHandler(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  const now = Date.now();
+  const lastRunKey = `${KV_LAST_RUN}:${Math.floor(now / 60000)}`;
+  
+  const lastRun = await env.FLEET_CRON.get(lastRunKey);
+  if (lastRun) return;
+  
+  await env.FLEET_CRON.put(lastRunKey, "1", { expirationTtl: 120 });
+  
+  const jobs: CronJob[] = [];
+  const list = await env.FLEET_CRON.list({ prefix: `${KV_JOBS}:` });
+  
+  for (const key of list.keys) {
+    const job = await env.FLEET_CRON.get(key.name, "json") as CronJob;
+    if (job && job.enabled && job.nextRun <= now) {
+      jobs.push(job);
+    }
+  }
+  
+  for (const job of jobs) {
+    ctx.waitUntil(executeJob(job, env));
+  }
+}
+
+interface Env {
+  FLEET_CRON: KVNamespace;
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
     
-    <script>
-        function showAlert(message, type = 'success') {
-            const alert = document.getElementById('alert');
-            alert.textContent = message;
-            alert.className = 'alert ' + (type === 'success' ? 'alert-success' : 'alert-error');
-            alert.style.display = 'block';
-            setTimeout(() => alert.style.display = 'none', 5000);
-        }
-        
-        async function loadJobs() {
-            try {
-                const response = await fetch('/api/jobs');
-                const jobs = await response.json();
-                
-                const jobsList = document.getElementById('jobsList');
-                if (jobs.length === 0) {
-                    jobsList.innerHTML = '<div style="text-align: center; padding: 2rem; color: var(--text-secondary);">No scheduled jobs</div>';
-                    return;
-                }
-                
-                jobsList.innerHTML = jobs.map(job => \`
-                    <div class="job-item">
-                        <div class="job-info">
-                            <h4>\${job.name}</h4>
-                            <div class="job-meta">
-                                <span>\${job.cronExpression}</span>
-                                <span>\${job.endpoint}</span>
-                                <span>Next: \${new Date(job.nextRun).toLocaleString()}</span>
-                            </div>
-                        </div>
-                        <div>
-                            <span class="status-badge \${job.enabled ? 'status-active' : 'status-paused'}">
-                                \${job.enabled ? 'Active' : 'Paused'}
-                            </span>
-                            <button class="btn btn-danger" style="margin-left: 0.5rem;" onclick="deleteJob('\${job.id}')">
-                                Delete
-                            </button>
-                        </div>
-                    </div>
-                \`).join('');
-            } catch (error) {
-                console.error('Failed to load jobs:', error);
-            }
-        }
-        
-        async function loadHistory() {
-            try {
-                const response = await fetch('/api/history');
-                const history = await response.json();
-                
-                const historyList = document.getElementById('historyList');
-                if (history.length === 0) {
-                    historyList.innerHTML = '<div style="text-align: center; padding: 2rem; color: var(--text-secondary);">No execution history</div>';
-                    return;
-                }
-                
-                historyList.innerHTML = history.slice(0, 10).map(entry => \`
-                    <div class="history-item">
-                        <div class="history-header">
-                            <div>
-                                <strong>\${entry.jobName}</strong>
-                                <span class="history-status \${'status-' + entry.status}">
-                                    \${entry.status.toUpperCase()}
-                                </span>
-                            </div>
-                            <div class="history-time">
-                                \${new Date(entry.timestamp).to
-const sh = {"Content-Security-Policy":"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; frame-ancestors 'none'","X-Frame-Options":"DENY"};
-export default { async fetch(r: Request) { const u = new URL(r.url); if (u.pathname==='/health') return new Response(JSON.stringify({status:'ok'}),{headers:{'Content-Type':'application/json',...sh}}); return new Response(html,{headers:{'Content-Type':'text/html;charset=UTF-8',...sh}}); }};
+    switch (url.pathname) {
+      case "/api/schedule":
+        return handleSchedule(request, env);
+      case "/api/jobs":
+        return handleJobs(request, env);
+      case "/api/history":
+        return handleHistory(request, env);
+      case "/health":
+        return handleHealth();
+      case "/":
+        return handleHome();
+      default:
+        return new Response("Not Found", { status: 404 });
+    }
+  },
+  
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    await scheduledHandler(controller, env, ctx);
+  },
+};

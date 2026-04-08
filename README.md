@@ -1,6 +1,6 @@
 # fleet-cron
 
-Cron job scheduler for fleet — scheduled tasks, recurring health checks, batch processing
+Cron job scheduler for fleet
 
 Part of the [Cocapn fleet](https://github.com/Lucineer/the-fleet).
 
